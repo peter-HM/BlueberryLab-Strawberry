@@ -1,9 +1,9 @@
 # 🫐 BlueberryLab
 
 
-# 🍓 Strawberry — 서비스 기획서
+# 🍓 Strawberry — 서비스 개발 기획서
 
-> 버전 0.1 | 작성일: 2026.04  
+> 버전 0.2 | 작성일: 2026.04  
 > 개인 서버(RAM 4GB / 120GB) 기반 자체 운영 플랫폼
 
 ---
@@ -31,32 +31,37 @@
 
 ```
 [Mac / 외부 기기]
-       │ SSH / HTTPS (Cerbot -> SSL)
+       │ HTTPS (Certbot → SSL)
        ▼
-[Strawberry 서버 - Ubuntu]
+[DuckDNS] → strawberry.duckdns.org
        │
        ▼
 [Nginx Reverse Proxy] ← 모든 요청의 진입점
        │
+       ├── /habit, /lang, /links ...  → React 정적 파일 서빙
+       ├── /api/v1/habit/...          → habit-api 컨테이너
+       ├── /api/v1/lang/...           → lang-api 컨테이너
+       ├── /api/v1/monitor/...        → monitor-api 컨테이너
+       └── ...
+       │
    ┌───┴────────────────────────────────┐
    │         Docker Network             │
-   │  ┌────┐ ┌────┐ ┌────┐ ┌────┐       │
-   │  │ 앱1 │ │앱2 │ │ 앱3 │ │ 앱N│       │
-   │  └────┘ └────┘ └────┘ └────┘       │
-   │         ┌──────────┐               │
-   │         │ 공용 DB   │               │
-   │         │ (Postgres)│              │
-   │         └──────────┘               │
+   │  ┌──────────┐ ┌──────────┐        │
+   │  │ habit-api│ │ lang-api │  ...   │
+   │  └──────────┘ └──────────┘        │
+   │         ┌──────────┐              │
+   │         │ 공용 DB   │              │
+   │         │(Postgres) │              │
+   │         └──────────┘              │
    └────────────────────────────────────┘
 ```
 
 ### 핵심 원칙
 
-- 각 앱은 독립 컨테이너로 분리 → 한 앱이 죽어도 나머지에 영향 없음
-- 공용 PostgreSQL 하나에 앱별 스키마 분리 (DB 컨테이너는 공유)
-- 파일 저장소 컨테이너는 모든 앱이 공유 가능
-- Nginx가 도메인/경로 기반으로 각 컨테이너로 라우팅
-
+- 각 앱 백엔드는 독립 컨테이너로 분리 → 한 앱이 죽어도 나머지에 영향 없음
+- 프론트엔드(React)는 빌드 후 Nginx가 정적 파일로 서빙 (별도 컨테이너 불필요)
+- 공용 PostgreSQL 하나에 앱별 스키마 분리
+- Nginx가 경로 기반으로 각 컨테이너로 라우팅
 ---
 
 ## 3. 기술 스택
@@ -73,12 +78,158 @@
 | 알림    | Telegram Bot            | 개발의 난이도 따라 선택  |
 | SSL | Certbot                    | Https 자동 발급    |
 | 모니터링  | Netdata                 | 서버 리소스 모니터링 |
-
-
+| 인증      | JWT (Access + Refresh Token) | 표준 인증 방식, 보안 관리 용이 |
+| 도메인     | DuckDNS               | 무료 DDNS, 추후 유료 도메인 이전  |
+| DB 마이그레이션 | Alembic            | 스키마 변경을 코드로 관리         |
 
 ---
 
-## 4. 앱 목록 (v1.0)
+## 4. URL 라우팅 설계
+ 
+### 패턴
+ 
+```
+# 프론트엔드 — Nginx 정적 서빙
+strawberry.duckdns.org/{앱명}
+ 
+# 백엔드 — FastAPI
+strawberry.duckdns.org/api/v1/{앱명}/...
+```
+ 
+### 전체 경로
+ 
+| 앱        | 프론트엔드     | 백엔드                  |
+| -------- | --------- | -------------------- |
+| Habit    | /habit    | /api/v1/habit/...    |
+| Lang     | /lang     | /api/v1/lang/...     |
+| Links    | /links    | /api/v1/links/...    |
+| Monitor  | /monitor  | /api/v1/monitor/...  |
+| Papers   | /papers   | /api/v1/papers/...   |
+| Files    | /files    | /api/v1/files/...    |
+| Snippets | /snippets | /api/v1/snippets/... |
+| Hub (AI) | /hub      | /api/v1/hub/...      |
+ 
+---
+ 
+## 5. DB 스키마 설계
+ 
+### 공통 스키마 (common)
+ 
+```sql
+-- 유저 테이블
+common.users
+├── id           UUID  PK
+├── username     VARCHAR(50)   UNIQUE
+├── email        VARCHAR(255)  UNIQUE
+├── password     VARCHAR(255)  -- bcrypt 해시
+├── is_active    BOOLEAN DEFAULT true
+├── created_at   TIMESTAMP
+└── updated_at   TIMESTAMP
+ 
+-- 리프레시 토큰
+common.refresh_tokens
+├── id           UUID  PK
+├── user_id      UUID  FK → users.id
+├── token        VARCHAR(255)  UNIQUE
+├── expires_at   TIMESTAMP
+└── created_at   TIMESTAMP
+```
+ 
+**JWT 흐름**
+```
+로그인 (ID/PW)
+  ↓
+Access Token  (15~30분)  ← 매 요청마다 사용
+Refresh Token (7~30일)   ← Access Token 만료 시 재발급
+```
+ 
+---
+ 
+### App 01 — habit 스키마
+ 
+```sql
+-- 습관 정의
+habit.habits
+├── id           UUID  PK
+├── user_id      UUID  FK → common.users.id
+├── name         VARCHAR(100)
+├── description  TEXT
+├── color        VARCHAR(7)    -- 히트맵 색상 (#HEX)
+├── is_active    BOOLEAN DEFAULT true
+├── created_at   TIMESTAMP
+└── updated_at   TIMESTAMP
+ 
+-- 매일 체크인 기록
+habit.checkins
+├── id           UUID  PK
+├── habit_id     UUID  FK → habits.id
+├── user_id      UUID  FK → common.users.id
+├── checked_date DATE
+├── created_at   TIMESTAMP
+└── UNIQUE (habit_id, checked_date)   -- 하루 한 번만
+ 
+-- 할 일 (Todo)
+habit.todos
+├── id           UUID  PK
+├── user_id      UUID  FK → common.users.id
+├── title        VARCHAR(200)
+├── is_done      BOOLEAN DEFAULT false
+├── due_date     DATE
+├── created_at   TIMESTAMP
+└── updated_at   TIMESTAMP
+ 
+-- 일정 (Schedule)
+habit.schedules
+├── id           UUID  PK
+├── user_id      UUID  FK → common.users.id
+├── title        VARCHAR(200)
+├── description  TEXT
+├── start_at     TIMESTAMP
+├── end_at       TIMESTAMP
+├── created_at   TIMESTAMP
+└── updated_at   TIMESTAMP
+```
+ 
+> Streak(연속 달성일)은 별도 컬럼 없이 checkins 데이터를 쿼리해서 계산
+ 
+---
+ 
+### App 04 — monitor 스키마
+ 
+```sql
+-- 서버 리소스 스냅샷 (5분마다 저장)
+monitor.server_metrics
+├── id           UUID  PK
+├── cpu_percent  FLOAT
+├── ram_percent  FLOAT
+├── disk_percent FLOAT
+└── recorded_at  TIMESTAMP
+ 
+-- 컨테이너 상태 스냅샷
+monitor.container_metrics
+├── id             UUID  PK
+├── container_name VARCHAR(100)
+├── status         VARCHAR(50)   -- running / exited / paused
+├── cpu_percent    FLOAT
+├── ram_percent    FLOAT
+└── recorded_at    TIMESTAMP
+ 
+-- 알림 기록
+monitor.alerts
+├── id           UUID  PK
+├── type         VARCHAR(50)   -- cpu / ram / disk / container
+├── message      TEXT
+├── is_resolved  BOOLEAN DEFAULT false
+├── created_at   TIMESTAMP
+└── resolved_at  TIMESTAMP
+```
+ 
+> 실시간 데이터는 FastAPI에서 `psutil` + `docker SDK`로 직접 조회 (DB 저장 없음)  
+> DB에는 히스토리 데이터만 저장
+ 
+---
+
+## 6. 앱 목록 (v1.0)
 
 ### 🟢 App 01 — Habit Tracker
 
@@ -239,7 +390,7 @@
 
 ---
 
-## 5. 개발 로드맵
+## 7. 개발 로드맵
 
 ### Phase 1 — 기반 구축 (인프라)
 
@@ -269,29 +420,37 @@
 
 ---
 
-## 6. 디렉토리 구조 (예상)
+## 8. 디렉토리 구조 (예상)
 
 ```
-blueberrylab/
-├── terraform/          # 인프라 코드
-├── nginx/              # 프록시 설정
-├── docker-compose.yml  # 전체 서비스 정의
+
+strawberry/                     # 루트
+├── docs/
+│   ├── strawberry_plan.md      # 개발자 기획서
+│   └── strawberry_business.md  # 경영학적 기획서 (예정)
+├── terraform/                  # 인프라 코드
+├── nginx/
+│   └── conf.d/
+├── docker-compose.yml
 ├── apps/
-│   ├── habit/          # App 01
-│   ├── shadowing/      # App 02
-│   ├── linkvault/      # App 03
-│   ├── monitor/        # App 04
-│   ├── papers/         # App 05
-│   ├── files/          # App 06
-│   ├── snippets/       # App 07
-│   └── ai-hub/         # App 08
+│   ├── habit/
+│   │   ├── backend/
+│   │   └── frontend/
+│   ├── lang/
+│   ├── links/
+│   ├── monitor/
+│   ├── papers/
+│   ├── files/
+│   ├── snippets/
+│   └── hub/
 └── .github/
-    └── workflows/      # CI/CD
+    └── workflows/
+
 ```
 
 ---
 
-## 7. 확장 가능성 고려사항
+## 9. 확장 가능성 고려사항
 
 - **새 앱 추가:** `apps/` 아래 폴더 추가 + `docker-compose.yml` 에 서비스 한 줄 추가
 - **사용자 추가:** 인증 시스템 (App 공통 Auth 컨테이너) 으로 초대 기반 관리
@@ -301,4 +460,5 @@ blueberrylab/
 
 ---
 
-> 이 문서는 살아있는 문서입니다. 개발하면서 계속 업데이트 예정.
+> 이 문서는 개발자 관점의 살아있는 문서입니다. 개발하면서 계속 업데이트 예정.  
+> 경영학적 관점은 `strawberry_business.md` 참고.
