@@ -39,21 +39,28 @@
 [Nginx Reverse Proxy] ← 모든 요청의 진입점
        │
        ├── /habit, /lang, /links ...  → React 정적 파일 서빙
-       ├── /api/v1/habit/...          → habit-api 컨테이너
-       ├── /api/v1/lang/...           → lang-api 컨테이너
-       ├── /api/v1/monitor/...        → monitor-api 컨테이너
-       └── ...
        │
-   ┌───┴────────────────────────────────┐
-   │         Docker Network             │
-   │  ┌──────────┐ ┌──────────┐        │
-   │  │ habit-api│ │ lang-api │  ...   │
-   │  └──────────┘ └──────────┘        │
-   │         ┌──────────┐              │
-   │         │ 공용 DB   │              │
-   │         │(Postgres) │              │
-   │         └──────────┘              │
-   └────────────────────────────────────┘
+       ├── /api/v1/auth/*             → auth-api (검증 제외)
+       │
+       └── /api/v1/*                  → auth/verify 검증 먼저
+                │
+                ├── 유효 → 각 앱으로 전달 (X-User-Id 헤더 포함)
+                │     ├── /api/v1/habit/...   → habit-api
+                │     ├── /api/v1/lang/...    → lang-api
+                │     ├── /api/v1/monitor/... → monitor-api
+                │     └── ...
+                │
+                ├── 무효 → 401 Unauthorized
+   ┌────────────┴────────────────────────┐
+   │         Docker Network              │
+   │  ┌──────────┐ ┌──────────┐          │
+   │  │ habit-api│ │ lang-api │  ...     │
+   │  └──────────┘ └──────────┘          │
+   │         ┌──────────┐                │
+   │         │ 공용 DB   │                │
+   │         │(Postgres)│                │
+   │         └──────────┘                │
+   └─────────────────────────────────────┘
 ```
 
 ### 핵심 원칙
@@ -77,7 +84,7 @@
 | 프론트엔드 | React                   | FastApi와 검증된 조합  |
 | 알림    | Telegram Bot            | 개발의 난이도 따라 선택  |
 | SSL | Certbot                    | Https 자동 발급    |
-| 모니터링  | Netdata                 | 서버 리소스 모니터링 |
+| 모니터링 | Netdata | App 04 안정화 전까지 병행 운영, 이후 제거 예정 |
 | 인증      | JWT (Access + Refresh Token) | 표준 인증 방식, 보안 관리 용이 |
 | 도메인     | DuckDNS               | 무료 DDNS, 추후 유료 도메인 이전  |
 | DB 마이그레이션 | Alembic            | 스키마 변경을 코드로 관리         |
@@ -108,12 +115,17 @@ strawberry.duckdns.org/api/v1/{앱명}/...
 | Files    | /files    | /api/v1/files/...    |
 | Snippets | /snippets | /api/v1/snippets/... |
 | Hub (AI) | /hub      | /api/v1/hub/...      |
+| Auth | /api/v1/auth/... | (verify는 Nginx 내부 전용) |
  
 ---
  
 ## 5. DB 스키마 설계
  
 ### 공통 스키마 (common)
+
+common 스키마 — Auth 컨테이너가 단독으로 관리
+각 앱은 common 스키마에 직접 접근하지 않음
+user_id는 Auth가 검증 후 헤더로 전달
  
 ```sql
 -- 유저 테이블
@@ -155,6 +167,7 @@ habit.habits
 ├── name         VARCHAR(100)
 ├── description  TEXT
 ├── color        VARCHAR(7)    -- 히트맵 색상 (#HEX)
+├── goal         INTEGER DEFAULT 30  -- 월 목표 횟수 추가
 ├── is_active    BOOLEAN DEFAULT true
 ├── created_at   TIMESTAMP
 └── updated_at   TIMESTAMP
@@ -168,26 +181,6 @@ habit.checkins
 ├── created_at   TIMESTAMP
 └── UNIQUE (habit_id, checked_date)   -- 하루 한 번만
  
--- 할 일 (Todo)
-habit.todos
-├── id           UUID  PK
-├── user_id      UUID  FK → common.users.id
-├── title        VARCHAR(200)
-├── is_done      BOOLEAN DEFAULT false
-├── due_date     DATE
-├── created_at   TIMESTAMP
-└── updated_at   TIMESTAMP
- 
--- 일정 (Schedule)
-habit.schedules
-├── id           UUID  PK
-├── user_id      UUID  FK → common.users.id
-├── title        VARCHAR(200)
-├── description  TEXT
-├── start_at     TIMESTAMP
-├── end_at       TIMESTAMP
-├── created_at   TIMESTAMP
-└── updated_at   TIMESTAMP
 ```
  
 > Streak(연속 달성일)은 별도 컬럼 없이 checkins 데이터를 쿼리해서 계산
@@ -217,11 +210,22 @@ monitor.container_metrics
 -- 알림 기록
 monitor.alerts
 ├── id           UUID  PK
-├── type         VARCHAR(50)   -- cpu / ram / disk / container
+├── type         VARCHAR(50)  -- cpu / ram / disk / container / security
 ├── message      TEXT
 ├── is_resolved  BOOLEAN DEFAULT false
 ├── created_at   TIMESTAMP
 └── resolved_at  TIMESTAMP
+
+-- 보안 로그 추가
+monitor.security_logs
+├── id           UUID  PK
+├── ip           VARCHAR(45)   -- IPv6 대응
+├── type         VARCHAR(50)   -- login_fail / suspicious_request / not_found
+├── path         VARCHAR(255)  -- 접근 URL
+├── count        INTEGER       -- 누적 횟수
+├── is_alerted   BOOLEAN DEFAULT false
+├── created_at   TIMESTAMP
+└── updated_at   TIMESTAMP
 ```
  
 > 실시간 데이터는 FastAPI에서 `psutil` + `docker SDK`로 직접 조회 (DB 저장 없음)  
@@ -231,21 +235,55 @@ monitor.alerts
 
 ## 6. 앱 목록 (v1.0)
 
-### 🟢 App 01 — Habit Tracker
+### 🔴 App 00 — 인증 (Auth) (개발 우선순위 1)
 
-**목적:** 매일 반복할 습관을 기록하고 시각화
+**역할:** 모든 앱의 인증을 담당하는 중앙 인증 컨테이너.
+Nginx가 모든 API 요청을 Auth에 먼저 검증 요청하고,
+각 앱은 JWT를 직접 처리하지 않음
+
+**핵심 기능:**
+- 로그인 (ID/PW → Access Token + Refresh Token 발급)
+- Access Token 재발급 (Refresh Token 사용)
+- 로그아웃 (Refresh Token 삭제)
+- 토큰 검증 (Nginx 내부 전용 /auth/verify)
+- 검증 후 user_id를 헤더에 담아 각 앱으로 전달
+
+**API:**
+- POST /api/v1/auth/login
+- POST /api/v1/auth/refresh
+- POST /api/v1/auth/logout
+- GET  /auth/verify  ← Nginx 내부 전용, 외부 접근 불가
+
+### 🔴 App 01 — Habit Tracker
+
+**역할:** 매일 반복할 습관을 기록하고 시각화하는 앱. 달성률과 패턴을 한눈에 파악
+
 
 **핵심 기능:**
 
-- 습관 생성 / 수정 / 삭제
-- 매일 체크인 (완료 여부 기록)
-- 달력 히트맵 (GitHub 잔디 형태)
-- 연속 달성일 (Streak) 표시
+- 습관 관리
+  - 습관 생성 / 수정 / 삭제
+  - 습관별 월 목표 횟수 (Goal) 설정
+  - 습관별 아이콘 / 색상 설정
+  - 매일 체크인
+  - 연속 달성일 (Streak) 계산
+- 대시보드
+  - Daily Completion Rate 라인 차트
+  - Monthly Progress 도넛 차트
+  - 주차별 Overview (달성 수 + 달성률)
+  - Top Habits 랭킹
+  - Overall Progress (Done / Left / 달성률 / 바 차트)
+- 히트맵 테이블
+  - 습관 × 날짜 그리드
+  - 날짜별 체크 표시
+  - 연도 / 월 필터
+
+**유저별 데이터 분리:** 모든 데이터는 `user_id`로 필터링하여 각자의 데이터만 접근
 
 **확장 가능성:**
 
 - 텔레그램 봇으로 매일 아침 리마인더
-- AI 허브 연동 → 습관 패턴 분석
+- HUB 연동 → 습관 패턴 분석
 
 ---
 
@@ -288,19 +326,39 @@ monitor.alerts
 
 ### 🟢 App 04 — 서버 모니터링 (Monitor)
 
-**목적:** blueberryLab 서버 상태 실시간 확인
-
+**역할:** Strawberry 서버 및 전체 컨테이너 상태를 실시간으로 감시하는 인프라 필수 앱. 다른 앱들이 살아있는지 가장 먼저 확인할 수 있어야 하므로 최우선 개발
+ 
 **핵심 기능:**
-
-- CPU / RAM / 디스크 사용량 대시보드
-- 각 컨테이너 상태 확인 (실행 중 / 중지)
-- 이상 감지 시 텔레그램 알림
-- 최근 24시간 그래프
-
+ 
+- 실시간 대시보드
+  - CPU / RAM / 디스크 현재 사용량
+  - 각 컨테이너 상태 (running / exited / paused)
+  - 최근 24시간 리소스 그래프
+- 알림 임계치 관리
+  - 대시보드에서 임계치 직접 조정 가능
+  - CPU(5분 평균) 경고 80% / 위험 90%
+  - RAM 경고 85% / 위험 95%
+  - 디스크 경고 80% / 위험 90%
+  - 컨테이너 다운 즉시 알림
+- 히스토리
+  - 5분마다 스냅샷 저장
+  - 7일치 보관 후 자동 삭제
+- 알림
+  - 경고 / 위험 단계별 텔레그램 알림
+  - 알림 이력 기록 및 해결 여부 관리
+- 보안 로그
+  - 비정상 요청 패턴 감지 (단시간 대량 요청)
+  - 존재하지 않는 URL 반복 접근 감지
+  - 의심 IP 텔레그램 알림
+  - 로그인 실패 횟수 기록
+  - 특정 IP 5회 이상 실패 시 텔레그램 알림
+**기술 구현:**
+- 실시간 데이터: `psutil` (서버 리소스) + `docker SDK` (컨테이너 상태)
+- 히스토리: PostgreSQL `monitor` 스키마
 **확장 가능성:**
-
 - AWS 등 외부 서버도 추가 모니터링
 - 로그 수집 및 분석
+
 
 ---
 
@@ -399,9 +457,11 @@ monitor.alerts
 - [ ] Nginx Reverse Proxy 설정
 - [ ] PostgreSQL 컨테이너 구성
 - [ ] GitHub Actions CI/CD 파이프라인 구성
+- [ ] DuckDNS 도메인 등록 + Certbot SSL 설정
 
 ### Phase 2 — 첫 번째 앱 (MVP)
 
+- [ ] App 00 Auth (모든 앱의 전제 조건)
 - [ ] App 04 모니터링 (가장 단순, 인프라 검증용)
 - [ ] App 01 Habit Tracker
 
@@ -433,6 +493,8 @@ strawberry/                     # 루트
 │   └── conf.d/
 ├── docker-compose.yml
 ├── apps/
+│   ├── auth/           
+│   │    └── backend/
 │   ├── habit/
 │   │   ├── backend/
 │   │   └── frontend/
@@ -457,6 +519,7 @@ strawberry/                     # 루트
 - **외부 공개:** Nginx에 도메인 + SSL 추가만으로 가능
 - **클라우드 이전:** Docker 기반이라 AWS / GCP 이전 용이
 - **앱 교체:** 컨테이너 단위로 교체 가능, 다른 앱에 영향 없음
+- **스키마 변경:** Alembic 마이그레이션으로 안전하게 관리
 
 ---
 
